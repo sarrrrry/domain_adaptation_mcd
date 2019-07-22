@@ -4,9 +4,12 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [dev-packages]
+optuna = "*"
 
 [packages]
 torch = "==1.1"
+torchvision = "*"
+tqdm = "*"
 
 [requires]
 python_version = "3.7"
