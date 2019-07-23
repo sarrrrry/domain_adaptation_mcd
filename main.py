@@ -49,7 +49,7 @@ class Net(BaseMCD):
 
     def forward(self, x):
         x = self.generator(x)
-        x = x.view(-1, 4 * 4 * 50)
+        x = x.view(x.shape[0], -1)
         x_f1 = self.classifier_f1(x)
         x_f2 = self.classifier_f2(x)
         return x_f1, x_f2
@@ -73,18 +73,27 @@ class Config:
         pass
 
     class Optim(BaseChildConfig):
-        name = "sgd"
-        lr_g = 0.00001
-        lr_c = 0.001
-        momentum = 0.5
+        c_name = "adam"
+        # c_lr = 6.648093005579153e-08  # from optuna
+        c_lr = 0.00189  # from optuna
+        # c_momentum = 0.5
+        c_weight_decay = 0.4179178183813419  # from optuna
+        g_name = "adam"
+        g_lr = 0.00870096400060322  # from optuna
+        # g_momentum = 0.5
+        g_weight_decay = 0.14119666256472618  # from optuna
 
     def __init__(self):
+        # self.multiply_loss_discrepancy = 2
+        self.multiply_loss_discrepancy = 0.5
         self.seed = 1
         self.batch_size = 64
         self.test_batch_size = 64
-        self.epochs = 1
+        # self.epochs = 1
+        self.epochs = 100
         self.log_interval = 10
         self.save_model = ""
+        self.N_repeat_genrator_update = 6  # from optuna
         self.optim = self.Optim()
 
 
@@ -107,43 +116,52 @@ class Device:
 
 
 class ConcatDataset(torch.utils.data.Dataset):
-    def __init__(self, *datasets):
-        self.datasets = datasets
+    def __init__(self, source, target):
+        self.source = source
+        self.target = target
 
     def __getitem__(self, i):
-        return tuple(d[i] for d in self.datasets)
+        return self.source[i], self.target[i]
 
     def __len__(self):
-        return min(len(d) for d in self.datasets)
+        return min(len(self.source), len(self.target))
 
 
 class TwoDomainDataLoader:
-    def __init__(self, device: Device, batch_size: int, test_batch_size: int):
+    def __init__(self, device: Device, batch_size: int, test_batch_size: int, seed=1):
         kwargs = {'num_workers': 1, 'pin_memory': True} if device.is_cuda else {}
 
         DATA_ROOT = "/raid/pytorch"
         source = datasets.MNIST(
             str(DATA_ROOT), train=True, download=True,
             transform=transforms.Compose([
+                transforms.Grayscale(),
+                transforms.Resize((28, 28)),
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,))
             ])
         )
-        target = datasets.MNIST(
-            str(DATA_ROOT), train=True, download=True,
+        target = datasets.SVHN(
+            str(DATA_ROOT), split="train", download=True,
             transform=transforms.Compose([
+                transforms.Grayscale(),
+                transforms.Resize((28, 28)),
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,))
             ])
         )
         train_dataset = ConcatDataset(source, target)
         val_dataset = ConcatDataset(source, target)
+
+        def worker_init_fn(worker_id):
+            random.seed(seed)
         self.train = torch.utils.data.DataLoader(
             train_dataset,
-            batch_size=batch_size, shuffle=True, **kwargs)
+            batch_size=batch_size, shuffle=True,
+            worker_init_fn=worker_init_fn, **kwargs)
         self.val = torch.utils.data.DataLoader(
             val_dataset, batch_size=test_batch_size,
-            shuffle=True, **kwargs)
+            shuffle=True, worker_init_fn=worker_init_fn, **kwargs)
 
     @property
     def train_len(self):
@@ -154,49 +172,31 @@ class TwoDomainDataLoader:
         return len(self.val.dataset)
 
 
-from abc import ABCMeta
-
-
-class BaseGenClsOptimizer(metaclass=ABCMeta):
-    generator = None
-    classifier = None
-
-
-class Optimizer(BaseGenClsOptimizer):
+class Optimizer:
+    supported = {
+        "sgd": optim.SGD,
+        "adam": optim.Adam
+    }
     def __init__(self, model: BaseMCD, cfg: Config.Optim):
         model_params = model.parameters()
-        self.generator = optim.SGD(
+
+        if not cfg.c_name in self.supported.keys():
+            raise ValueError
+        if not cfg.g_name in self.supported.keys():
+            raise ValueError
+
+        self.generator = self.supported[cfg.g_name](
             model_params[0],
-            lr=cfg.lr_g, momentum=cfg.momentum
+            lr=cfg.g_lr, weight_decay=cfg.g_weight_decay
         )
-        self.classifier = optim.SGD(
+        self.classifier = self.supported[cfg.c_name](
             model_params[1],
-            lr=cfg.lr_c, momentum=cfg.momentum
+            lr=cfg.c_lr, weight_decay=cfg.c_weight_decay
         )
 
     def zero_grad(self):
         self.generator.zero_grad()
         self.classifier.zero_grad()
-
-
-class OptunaOptimizer(BaseGenClsOptimizer):
-    def __init__(self, model: BaseMCD, cfg: Config, trial):
-        lr_c = trial.suggest_loguniform("lr_c", 1e-10, 1e-3)
-        lr_d = trial.suggest_loguniform("lr_d", 1e-10, 1e-3)
-        model_params = model.parameters()
-        self.generator = optim.SGD(
-            model_params[0],
-            lr=cfg.optim.lr_g, momentum=cfg.optim.momentum
-        )
-        self.classifier = optim.SGD(
-            model_params[1],
-            lr=cfg.optim.lr_c, momentum=cfg.optim.momentum
-        )
-
-    def zero_grad(self):
-        self.generator.zero_grad()
-        self.classifier.zero_grad()
-
 
 class Diff2d(nn.Module):
     def __init__(self, weight=None):
@@ -204,7 +204,8 @@ class Diff2d(nn.Module):
         self.weight = weight
 
     def forward(self, inputs1, inputs2):
-        return torch.mean(torch.abs(F.softmax(inputs1, dim=1) - F.softmax(inputs2, dim=1)))
+        # return torch.mean(torch.abs(F.softmax(inputs1, dim=1) - F.softmax(inputs2, dim=1)))
+        return torch.abs(F.softmax(inputs1, dim=1) - F.softmax(inputs2, dim=1))
 
 
 class Criterion(nn.Module):
@@ -219,8 +220,7 @@ class Criterion(nn.Module):
         super().__init__()
         self.name = name
         if name == self.CEL:
-            # self.loss_func = nn.CrossEntropyLoss()
-            self.loss_func = nn.NLLLoss(reduction=reduction)
+            self.loss_func = nn.CrossEntropyLoss(reduction=reduction)
         elif name == self.diff:
             self.loss_func = Diff2d()
         else:
@@ -234,24 +234,40 @@ class Criterion(nn.Module):
 
 
 class MCDUpdater:
-    def __init__(self, cfg: Config, model: nn.Module, dataloader: TwoDomainDataLoader,
-                 optimizer: BaseGenClsOptimizer, device: Device,
-                 classifier_criterion: Criterion, discrepancy_criterion: Criterion):
-        self.cfg = cfg
+    def __init__(self, cfg: Config, model: nn.Module,
+                 dataloader: TwoDomainDataLoader,
+                 device: Device,
+                 optimizer: Optimizer,
+                 criterion_c: Criterion,
+                 criterion_g: Criterion):
+        """
+        c ≡ classifier
+        g ≡ generator
+
+        :param cfg:
+        :param model:
+        :param dataloader:
+        :param device:
+        :param optimizer_c:
+        :param optimizer_g:
+        :param criterion_c:
+        :param criterion_g:
+        """
         self.model = model
         self.dataloader = dataloader
-        self.optimizer = optimizer
         self.iter = 0
         self.device = device
-        self.classifier_criterion = classifier_criterion
-        self.discrepancy_criterion = discrepancy_criterion
+        self.optimizer = optimizer
+        self.criterion_c = criterion_c
+        self.criterion_g = criterion_g
+        self.multiply_loss_discrepancy = cfg.multiply_loss_discrepancy
 
     def _update_classifier(self, src_imgs, src_lbls):
         ### update generator and classifier by source samples
         self.optimizer.zero_grad()
         out_f1, out_f2 = self.model(src_imgs)
-        loss_f1 = self.classifier_criterion(out_f1, src_lbls)
-        loss_f2 = self.classifier_criterion(out_f2, src_lbls)
+        loss_f1 = self.criterion_c(out_f1, src_lbls)
+        loss_f2 = self.criterion_c(out_f2, src_lbls)
         loss = loss_f1 + loss_f2
         loss.backward()
         self.optimizer.generator.step()
@@ -261,11 +277,11 @@ class MCDUpdater:
     def _maximize_discrepancy(self, src_imgs, src_lbls, tgt_imgs):
         self.optimizer.zero_grad()
         out_src_f1, out_src_f2 = self.model(src_imgs)
-        loss_src_f1 = self.classifier_criterion(out_src_f1, src_lbls)
-        loss_src_f2 = self.classifier_criterion(out_src_f2, src_lbls)
+        loss_src_f1 = self.criterion_c(out_src_f1, src_lbls)
+        loss_src_f2 = self.criterion_c(out_src_f2, src_lbls)
 
         out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
-        loss_discrepancy = self.discrepancy_criterion(out_tgt_f1, out_tgt_f2)
+        loss_discrepancy = self.criterion_g(out_tgt_f1, out_tgt_f2)
         loss = loss_src_f1 + loss_src_f2 - loss_discrepancy
         loss.backward()
         self.optimizer.classifier.step()
@@ -273,7 +289,7 @@ class MCDUpdater:
     def _minimize_discrepancy(self, tgt_imgs):
         self.optimizer.zero_grad()
         out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
-        loss = self.discrepancy_criterion(out_tgt_f1, out_tgt_f2)
+        loss = self.criterion_g(out_tgt_f1, out_tgt_f2) * self.multiply_loss_discrepancy
         loss.backward()
         self.optimizer.generator.step()
         return loss
@@ -299,7 +315,8 @@ class MCDUpdater:
                 f"Loss C: {loss_c:.6f} | "
                 f"Loss D: {loss_d:.6f} | "
             )
-            pbar.set_description(msg)
+            if batch_idx % 10 == 0:
+                pbar.set_description(msg)
 
     def evaluate(self):
         self.model.eval()
@@ -327,8 +344,8 @@ class MCDUpdater:
                 correct_src += pred_src.eq(src_lbls.view_as(pred_src)).sum().item()
                 correct_tgt += pred_tgt.eq(tgt_lbls.view_as(pred_tgt)).sum().item()
 
-                loss_src += self.classifier_criterion(out_src, src_lbls).item()
-                loss_tgt += self.classifier_criterion(out_tgt, tgt_lbls).item()
+                loss_src += self.criterion_c(out_src, src_lbls).item()
+                loss_tgt += self.criterion_c(out_tgt, tgt_lbls).item()
 
         loss_src /= self.dataloader.val_len
         loss_tgt /= self.dataloader.val_len
@@ -349,7 +366,7 @@ class MCDUpdater:
         return mean_acc_src, mean_acc_tgt
 
 
-def train():
+def train(seed):
     cfg = Config()
     torch.manual_seed(cfg.seed)
 
@@ -359,43 +376,9 @@ def train():
         device=device,
         batch_size=cfg.batch_size,
         test_batch_size=cfg.test_batch_size,
+        seed=seed
     )
     model = Net().to(device.get())
-    optimizer = Optimizer(
-        model=model,
-        cfg=cfg
-    )
-    updater = MCDUpdater(
-        cfg=cfg, model=model, dataloader=dataloader,
-        optimizer=optimizer, device=device,
-        classifier_criterion=Criterion(name=Criterion.CEL),
-        discrepancy_criterion=Criterion(name=Criterion.diff)
-    )
-
-    for epoch in range(1, cfg.epochs + 1):
-        print(f"epoch: [{epoch} / {cfg.epochs}]")
-        updater.train(N_repeat_generator_update=4)
-        updater.evaluate()
-
-    if (cfg.save_model):
-        torch.save(model.state_dict(), "mnist_cnn.pt")
-
-
-def objective(trial):
-    cfg = Config()
-    torch.manual_seed(cfg.seed)
-
-    device = Device(N_GPUs=2)
-
-    dataloader = TwoDomainDataLoader(
-        device=device,
-        batch_size=cfg.batch_size,
-        test_batch_size=cfg.test_batch_size,
-    )
-    model = Net().to(device.get())
-
-    cfg.optim.lr_c = trial.suggest_loguniform("lr_c", 1e-10, 1e-3)
-    cfg.optim.lr_g = trial.suggest_loguniform("lr_g", 1e-10, 1e-3)
     optimizer = Optimizer(
         model=model,
         cfg=cfg.optim
@@ -403,41 +386,108 @@ def objective(trial):
     updater = MCDUpdater(
         cfg=cfg, model=model, dataloader=dataloader,
         optimizer=optimizer, device=device,
-        classifier_criterion=Criterion(name=Criterion.CEL),
-        discrepancy_criterion=Criterion(name=Criterion.diff)
+        criterion_c=Criterion(name=Criterion.CEL, reduction="sum"),
+        criterion_g=Criterion(name=Criterion.diff)
     )
 
     for epoch in range(1, cfg.epochs + 1):
         print(f"epoch: [{epoch} / {cfg.epochs}]")
-        updater.train(N_repeat_generator_update=4)
+        updater.train(N_repeat_generator_update=cfg.N_repeat_genrator_update)
+        updater.evaluate()
+
+    if (cfg.save_model):
+        torch.save(model.state_dict(), "mnist_cnn.pt")
+
+
+import optuna
+
+
+def objective(trial: optuna.trial.Trial):
+    seed = 1
+
+    cfg = Config()
+    cfg.seed = seed
+    cfg.epochs = 1
+    torch.manual_seed(cfg.seed)
+
+    device = Device(N_GPUs=2)
+
+    dataloader = TwoDomainDataLoader(
+        device=device,
+        batch_size=cfg.batch_size,
+        test_batch_size=cfg.test_batch_size,
+        seed=seed
+    )
+    model = Net().to(device.get())
+
+    # trial_opt = list(Optimizer.supported.keys())
+    # trial_opt = ["adam"]
+    # cfg.optim.c_name = trial.suggest_categorical("c_opt", trial_opt)
+    cfg.optim.c_lr = trial.suggest_loguniform("c_lr", 1e-10, 1e-1)
+    cfg.optim.c_weight_decay = trial.suggest_uniform("c_wd", 0., 1.)
+    # cfg.optim.g_name = trial.suggest_categorical("g_opt", trial_opt)
+    cfg.optim.g_lr = trial.suggest_loguniform("g_lr", 1e-10, 1e-1)
+    cfg.optim.g_weight_decay = trial.suggest_uniform("g_wd", 0., 1.)
+    cfg.optim.multiply_loss_discrepancy = trial.suggest_uniform("mld", -2, 2)
+    optimizer = Optimizer(
+        model=model,
+        cfg=cfg.optim
+    )
+    updater = MCDUpdater(
+        cfg=cfg, model=model, dataloader=dataloader,
+        optimizer=optimizer, device=device,
+        criterion_c=Criterion(name=Criterion.CEL),
+        criterion_g=Criterion(name=Criterion.diff)
+    )
+
+    mean_acc_tgt = 0.
+    N_rgu = trial.suggest_int("Nrepeat", 1, 10)
+    for epoch in range(1, cfg.epochs + 1):
+        print(f"epoch: [{epoch} / {cfg.epochs}]")
+        updater.train(N_repeat_generator_update=N_rgu)
         mean_acc_src, mean_acc_tgt = updater.evaluate()
     error_rate = 1 - mean_acc_tgt
     return error_rate
 
 
+
 if __name__ == '__main__':
-    # train()
-    import optuna
+    import random
+    import numpy as np
 
-    study = optuna.create_study()
-    study.optimize(objective, n_trials=2)
+    seed = 1
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    ##########
-    # oputna log
-    ##########
-    import json
+    isOptuna = False
+    # isOptuna = True
 
-    with open("./best_param.json", "w") as fw:
-        json.dump(study.best_params, fw)
-    print("")
-    print("++++ optuna trial ++++")
-    print('Number of finished trials: ', len(study.trials))
-    print('Best trial:')
-    trial = study.best_trial
-    print('  Value: ', trial.value)
-    print('  Params: ')
-    for key, value in trial.params.items():
-        print('    {}: {}'.format(key, value))
-    print('  User attrs:')
-    for key, value in trial.user_attrs.items():
-        print('    {}: {}'.format(key, value))
+    if not isOptuna:
+        train(seed)
+    else:
+
+        study = optuna.create_study()
+        study.optimize(objective, n_trials=100, n_jobs=-1)
+
+        ##########
+        # oputna log
+        ##########
+        import json
+
+        print("")
+        print("++++ optuna trial ++++")
+        print('Number of finished trials: ', len(study.trials))
+        print('Best trial:')
+        trial = study.best_trial
+        print('  Value: ', trial.value)
+        print('  Params: ')
+        for key, value in trial.params.items():
+            print('    {}: {}'.format(key, value))
+        print('  User attrs:')
+        for key, value in trial.user_attrs.items():
+            print('    {}: {}'.format(key, value))
+        with open("./best_param.json", "w") as fw:
+            json.dump(study.best_params, fw)
