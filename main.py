@@ -37,12 +37,54 @@ from abc import ABCMeta
 
 
 class BaseMCD(nn.Module, metaclass=ABCMeta):
-    pass
+    STATE_KEY_GEN = "generator"
+    STATE_KEY_CLS_F1 = "classifier_f1"
+    STATE_KEY_CLS_F2 = "classifier_f2"
 
+    def __init__(self, ckpt: str = None):
+        super().__init__()
+        self.generator: nn.Module
+        self.classifier_f1: nn.Module
+        self.classifier_f2: nn.Module
+
+    def load(self, path):
+        state_dict = torch.load(str(path))
+        try:
+            self.generator.load_state_dict(state_dict[self.STATE_KEY_GEN])
+
+            self.classifier_f1.load_state_dict(state_dict[self.STATE_KEY_CLS_F1])
+            self.classifier_f2.load_state_dict(state_dict[self.STATE_KEY_CLS_F2])
+        except KeyError:
+            keys = list(state_dict.keys())
+            msg = str(
+                "KeyErrored skip: \n"
+                f"\tReceive: {key}\n"
+                f"\tExpect : {keys}"
+            )
+            print(msg)
+        return self
+
+    def save(self, path: str) -> None:
+        print("*** saving model ...", end="")
+        state_dict = {
+            self.STATE_KEY_GEN: self.generator.state_dict(),
+            self.STATE_KEY_CLS_F1: self.classifier_f1.state_dict(),
+            self.STATE_KEY_CLS_F2: self.classifier_f2.state_dict(),
+        }
+        torch.save(state_dict, str(path))
+        print("DONE")
+
+    def parameters(self, recurse=True):
+        gen_params = self.generator.parameters(recurse=recurse)
+
+        f1_cls_params = self.classifier_f1.parameters(recurse=recurse)
+        f2_cls_params = self.classifier_f2.parameters(recurse=recurse)
+
+        return gen_params, f1_cls_params, f2_cls_params
 
 class Net(BaseMCD):
-    def __init__(self):
-        super(Net, self).__init__()
+    def __init__(self, ckpt: str = None):
+        super().__init__()
         self.generator = Net_FeatureExtractore()
         self.classifier_f1 = Net_Classifier()
         self.classifier_f2 = Net_Classifier()
@@ -54,16 +96,6 @@ class Net(BaseMCD):
         x_f2 = self.classifier_f2(x)
         return x_f1, x_f2
 
-    def parameters(self, recurse=True):
-        gen_params = self.generator.parameters(recurse=recurse)
-
-        cls_params = []
-        cls_params.extend(list(self.classifier_f1.parameters(recurse=recurse)))
-        cls_params.extend(list(self.classifier_f2.parameters(recurse=recurse)))
-
-        return gen_params, cls_params
-
-
 
 from abc import ABCMeta
 
@@ -73,27 +105,30 @@ class Config:
         pass
 
     class Optim(BaseChildConfig):
-        c_name = "adam"
-        # c_lr = 6.648093005579153e-08  # from optuna
-        c_lr = 0.00189  # from optuna
-        # c_momentum = 0.5
-        c_weight_decay = 0.4179178183813419  # from optuna
-        g_name = "adam"
-        g_lr = 0.00870096400060322  # from optuna
-        # g_momentum = 0.5
-        g_weight_decay = 0.14119666256472618  # from optuna
+        c_name = "sgd"
+        c_lr = 0.000001  # from optuna
+        # c_weight_decay = 0.173  # from optuna
+        # c_name = "adam"
+        # c_lr = 0.0002  # from optuna
+        c_weight_decay = 0.0005  # from optuna
+        g_name = "sgd"
+        g_lr = 0.000001  # from optuna
+        # g_weight_decay = 0.254  # from optuna
+        # g_name = "adam"
+        # g_lr = 0.0002  # from optuna
+        g_weight_decay = 0.0005  # from optuna
 
     def __init__(self):
-        # self.multiply_loss_discrepancy = 2
-        self.multiply_loss_discrepancy = 0.5
+        self.N_repeat_genrator_update = 5  # from optuna
+        self.multiply_loss_discrepancy = 1.8  # from optuna
         self.seed = 1
-        self.batch_size = 64
-        self.test_batch_size = 64
-        # self.epochs = 1
-        self.epochs = 100
+        # self.batch_size = 64
+        self.batch_size = 4056
+        # self.test_batch_size = 64
+        self.test_batch_size = self.batch_size
+        self.epochs = 10000
         self.log_interval = 10
-        self.save_model = ""
-        self.N_repeat_genrator_update = 6  # from optuna
+        self.save_model = True
         self.optim = self.Optim()
 
 
@@ -132,8 +167,8 @@ class TwoDomainDataLoader:
         kwargs = {'num_workers': 1, 'pin_memory': True} if device.is_cuda else {}
 
         DATA_ROOT = "/raid/pytorch"
-        source = datasets.MNIST(
-            str(DATA_ROOT), train=True, download=True,
+        source = datasets.SVHN(
+            str(DATA_ROOT), split="train", download=True,
             transform=transforms.Compose([
                 transforms.Grayscale(),
                 transforms.Resize((28, 28)),
@@ -141,8 +176,8 @@ class TwoDomainDataLoader:
                 transforms.Normalize((0.1307,), (0.3081,))
             ])
         )
-        target = datasets.SVHN(
-            str(DATA_ROOT), split="train", download=True,
+        target = datasets.MNIST(
+            str(DATA_ROOT), train=True, download=True,
             transform=transforms.Compose([
                 transforms.Grayscale(),
                 transforms.Resize((28, 28)),
@@ -172,13 +207,60 @@ class TwoDomainDataLoader:
         return len(self.val.dataset)
 
 
+import torch.optim.lr_scheduler
+
+
+class LR_Scheduler:
+    class NoneScheduler(torch.optim.lr_scheduler._LRScheduler):
+        def __init__(self):
+            pass
+
+        def step(self):
+            pass
+
+    EXP = "exp"
+    STP = "step"
+    COS = "cos"
+
+    def __init__(self, optimizer, name):
+        lrs = torch.optim.lr_scheduler
+        gen = optimizer.generator
+        cl1 = optimizer.classifier_f1
+        cl2 = optimizer.classifier_f2
+        if name == self.EXP:
+            self.generator = lrs.ExponentialLR(gen, gamma=0.9)
+            self.classifier_f1 = lrs.ExponentialLR(cl1, gamma=0.9)
+            self.classifier_f2 = lrs.ExponentialLR(cl2, gamma=0.9)
+        elif name == self.STP:
+            self.generator = lrs.StepLR(gen, step_size=30, gamma=0.9)
+            self.classifier_f1 = lrs.StepLR(cl1, step_size=30, gamma=0.9)
+            self.classifier_f2 = lrs.StepLR(cl2, step_size=30, gamma=0.9)
+        elif name == self.COS:
+            self.generator = lrs.CosineAnnealingLR(gen, 5e-6, 1e-10)
+            self.classifier_f1 = lrs.CosineAnnealingLR(cl1, 5e-6, 1e-10)
+            self.classifier_f2 = lrs.CosineAnnealingLR(cl2, 5e-6, 2e-20)
+        else:
+            self.generator = self.NoneScheduler()
+            self.classifier_f1 = self.NoneScheduler()
+            self.classifier_f2 = self.NoneScheduler()
+
+    def step(self):
+        self.generator.step()
+        self.classifier_f1.step()
+        self.classifier_f2.step()
+
 class Optimizer:
     supported = {
         "sgd": optim.SGD,
         "adam": optim.Adam
     }
-    def __init__(self, model: BaseMCD, cfg: Config.Optim):
-        model_params = model.parameters()
+    SCHEDULER_NONE = None
+    SCHEDULER_EXP = LR_Scheduler.EXP
+    SCHEDULER_STP = LR_Scheduler.STP
+    SCHEDULER_COS = LR_Scheduler.COS
+
+    def __init__(self, model_params, cfg: Config.Optim, scheduler: str = None):
+        model_params = model_params
 
         if not cfg.c_name in self.supported.keys():
             raise ValueError
@@ -186,17 +268,55 @@ class Optimizer:
             raise ValueError
 
         self.generator = self.supported[cfg.g_name](
-            model_params[0],
+            model_params[0], momentum=0.8,
+            # model_params[0],
             lr=cfg.g_lr, weight_decay=cfg.g_weight_decay
         )
-        self.classifier = self.supported[cfg.c_name](
-            model_params[1],
+        self.classifier_f1 = self.supported[cfg.c_name](
+            model_params[1], momentum=0.8,
+            # model_params[1],
+            lr=cfg.c_lr, weight_decay=cfg.c_weight_decay
+        )
+        self.classifier_f2 = self.supported[cfg.c_name](
+            model_params[2], momentum=0.8,
+            # model_params[2],
             lr=cfg.c_lr, weight_decay=cfg.c_weight_decay
         )
 
+        self.scheduler = LR_Scheduler(self, name=scheduler)
+
     def zero_grad(self):
         self.generator.zero_grad()
-        self.classifier.zero_grad()
+        self.classifier_f1.zero_grad()
+        self.classifier_f2.zero_grad()
+
+    def step_all(self):
+        self.step_generator()
+        self.step_classifier()
+
+    def step_classifier(self):
+        self.classifier_f1.step()
+        self.classifier_f2.step()
+
+    def step_generator(self):
+        self.generator.step()
+
+    def step_epoch(self):
+        self.scheduler.step()
+
+    @property
+    def lr(self):
+        gen = self.generator.param_groups[0]["lr"]
+        cl1 = self.classifier_f1.param_groups[0]["lr"]
+        cl2 = self.classifier_f2.param_groups[0]["lr"]
+        ret = {
+            "generator": gen,
+            "classifier_f1": cl1,
+            "classifier_f2": cl2,
+        }
+        return ret
+
+
 
 class Diff2d(nn.Module):
     def __init__(self, weight=None):
@@ -233,25 +353,21 @@ class Criterion(nn.Module):
         return loss
 
 
+class ClassifierMetrics:
+    def update(self, key: str, idx: int, value: torch.Tensor):
+        pass
+
 class MCDUpdater:
-    def __init__(self, cfg: Config, model: nn.Module,
+    def __init__(self, cfg: Config, model: BaseMCD,
                  dataloader: TwoDomainDataLoader,
                  device: Device,
                  optimizer: Optimizer,
                  criterion_c: Criterion,
-                 criterion_g: Criterion):
+                 criterion_g: Criterion,
+                 metrics: ClassifierMetrics):
         """
         c ≡ classifier
         g ≡ generator
-
-        :param cfg:
-        :param model:
-        :param dataloader:
-        :param device:
-        :param optimizer_c:
-        :param optimizer_g:
-        :param criterion_c:
-        :param criterion_g:
         """
         self.model = model
         self.dataloader = dataloader
@@ -261,42 +377,13 @@ class MCDUpdater:
         self.criterion_c = criterion_c
         self.criterion_g = criterion_g
         self.multiply_loss_discrepancy = cfg.multiply_loss_discrepancy
+        self.metrics = metrics
+        self.current_idx = 0
 
-    def _update_classifier(self, src_imgs, src_lbls):
-        ### update generator and classifier by source samples
-        self.optimizer.zero_grad()
-        out_f1, out_f2 = self.model(src_imgs)
-        loss_f1 = self.criterion_c(out_f1, src_lbls)
-        loss_f2 = self.criterion_c(out_f2, src_lbls)
-        loss = loss_f1 + loss_f2
-        loss.backward()
-        self.optimizer.generator.step()
-        self.optimizer.classifier.step()
-        return loss
-
-    def _maximize_discrepancy(self, src_imgs, src_lbls, tgt_imgs):
-        self.optimizer.zero_grad()
-        out_src_f1, out_src_f2 = self.model(src_imgs)
-        loss_src_f1 = self.criterion_c(out_src_f1, src_lbls)
-        loss_src_f2 = self.criterion_c(out_src_f2, src_lbls)
-
-        out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
-        loss_discrepancy = self.criterion_g(out_tgt_f1, out_tgt_f2)
-        loss = loss_src_f1 + loss_src_f2 - loss_discrepancy
-        loss.backward()
-        self.optimizer.classifier.step()
-
-    def _minimize_discrepancy(self, tgt_imgs):
-        self.optimizer.zero_grad()
-        out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
-        loss = self.criterion_g(out_tgt_f1, out_tgt_f2) * self.multiply_loss_discrepancy
-        loss.backward()
-        self.optimizer.generator.step()
-        return loss
-
-    def train(self, N_repeat_generator_update):
+    def train(self, N_repeat_generator_update: int) -> None:
         self.model.train()
 
+        print(self.optimizer.lr)
         pbar = tqdm(self.dataloader.train)
         for batch_idx, (source, target) in enumerate(pbar):
             src_imgs = source[0].to(self.device.get())
@@ -305,10 +392,7 @@ class MCDUpdater:
 
             loss_c = self._update_classifier(src_imgs, src_lbls).item()
             self._maximize_discrepancy(src_imgs, src_lbls, tgt_imgs)
-
-            loss_d = 0
-            for _ in range(N_repeat_generator_update):
-                loss_d += self._minimize_discrepancy(tgt_imgs).item()
+            loss_d = self._minimize_discrepancy(tgt_imgs, N_repeat=N_repeat_generator_update).item()
             loss_d /= N_repeat_generator_update
 
             msg = str(
@@ -317,6 +401,10 @@ class MCDUpdater:
             )
             if batch_idx % 10 == 0:
                 pbar.set_description(msg)
+
+            self.current_idx += 1
+        self.optimizer.step_epoch()
+        self.model.save("lates_model.ckpt")
 
     def evaluate(self):
         self.model.eval()
@@ -359,12 +447,50 @@ class MCDUpdater:
             f"\t\tsource: {loss_src:.4f}\n"
             f"\t\ttarget: {loss_tgt:.4f}\n"
             f"\tAccuracy: \n"
-            f"\t\tsource: {correct_src:.4f} / {self.dataloader.val_len} ({100 * mean_acc_src:.2f}%)\n"
-            f"\t\ttarget: {correct_tgt:.4f} / {self.dataloader.val_len} ({100 * mean_acc_tgt:.2f}%)\n"
+            f"\t\tsource: {int(correct_src)} / {self.dataloader.val_len} ({100 * mean_acc_src:.2f}%)\n"
+            f"\t\ttarget: {int(correct_tgt)} / {self.dataloader.val_len} ({100 * mean_acc_tgt:.2f}%)\n"
         )
         print(msg)
         return mean_acc_src, mean_acc_tgt
 
+    def _update_classifier(self, src_imgs, src_lbls):
+        ### update generator and classifier by source samples
+        self.optimizer.zero_grad()
+        out_f1, out_f2 = self.model(src_imgs)
+        loss_f1 = self.criterion_c(out_f1, src_lbls)
+        loss_f2 = self.criterion_c(out_f2, src_lbls)
+        loss = loss_f1 + loss_f2
+        loss.backward()
+        self.optimizer.step_all()
+        # self.metrics.update(key="loss_c", idx=self.current_idx, value=loss.item())
+        return loss
+
+    def _maximize_discrepancy(self, src_imgs, src_lbls, tgt_imgs):
+        self.optimizer.zero_grad()
+        out_src_f1, out_src_f2 = self.model(src_imgs)
+        loss_src_f1 = self.criterion_c(out_src_f1, src_lbls).mean()
+        loss_src_f2 = self.criterion_c(out_src_f2, src_lbls).mean()
+
+        out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
+        loss_discrepancy = self.criterion_g(out_tgt_f1, out_tgt_f2).mean()
+        loss_discrepancy *= self.multiply_loss_discrepancy
+        loss = loss_src_f1 + loss_src_f2 - loss_discrepancy
+        loss.backward()
+        self.optimizer.step_classifier()
+        # self.metrics.update(key="loss_max_d", idx=self.current_idx, value=loss.item())
+
+    def _minimize_discrepancy(self, tgt_imgs, N_repeat):
+        self.optimizer.zero_grad()
+        loss = torch.zeros((1), requires_grad=True).to(self.device.get())
+        for _ in range(N_repeat):
+            out_tgt_f1, out_tgt_f2 = self.model(tgt_imgs)
+            loss_discrepancy = self.criterion_g(out_tgt_f1, out_tgt_f2).mean()
+            loss_discrepancy *= self.multiply_loss_discrepancy
+            loss += loss_discrepancy
+        loss.backward()
+        self.optimizer.step_generator()
+        # self.metrics.update(key="loss_min_d", idx=self.current_idx, value=loss.item())
+        return loss
 
 def train(seed):
     cfg = Config()
@@ -378,16 +504,21 @@ def train(seed):
         test_batch_size=cfg.test_batch_size,
         seed=seed
     )
-    model = Net().to(device.get())
+    model = Net()
+    model.load("mnist_cnn.pt")
+    model.to(device.get())
     optimizer = Optimizer(
-        model=model,
-        cfg=cfg.optim
+        model_params=model.parameters(),
+        cfg=cfg.optim,
+        # scheduler=Optimizer.SCHEDULER_COS
+        scheduler=Optimizer.SCHEDULER_NONE
     )
     updater = MCDUpdater(
         cfg=cfg, model=model, dataloader=dataloader,
         optimizer=optimizer, device=device,
         criterion_c=Criterion(name=Criterion.CEL, reduction="sum"),
-        criterion_g=Criterion(name=Criterion.diff)
+        criterion_g=Criterion(name=Criterion.diff),
+        metrics=ClassifierMetrics(),
     )
 
     for epoch in range(1, cfg.epochs + 1):
@@ -396,7 +527,8 @@ def train(seed):
         updater.evaluate()
 
     if (cfg.save_model):
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+        ckpt_path = "mnist_cnn.pt"
+        model.save(ckpt_path)
 
 
 import optuna
@@ -407,7 +539,9 @@ def objective(trial: optuna.trial.Trial):
 
     cfg = Config()
     cfg.seed = seed
-    cfg.epochs = 1
+    # cfg.epochs = 1
+    cfg.epochs = 2
+
     torch.manual_seed(cfg.seed)
 
     device = Device(N_GPUs=2)
@@ -418,38 +552,45 @@ def objective(trial: optuna.trial.Trial):
         test_batch_size=cfg.test_batch_size,
         seed=seed
     )
-    model = Net().to(device.get())
 
-    # trial_opt = list(Optimizer.supported.keys())
-    # trial_opt = ["adam"]
-    # cfg.optim.c_name = trial.suggest_categorical("c_opt", trial_opt)
-    cfg.optim.c_lr = trial.suggest_loguniform("c_lr", 1e-10, 1e-1)
+    model = Net()
+    model.load("mnist_cnn.pt")
+    model.to(device.get())
+
     cfg.optim.c_weight_decay = trial.suggest_uniform("c_wd", 0., 1.)
-    # cfg.optim.g_name = trial.suggest_categorical("g_opt", trial_opt)
-    cfg.optim.g_lr = trial.suggest_loguniform("g_lr", 1e-10, 1e-1)
     cfg.optim.g_weight_decay = trial.suggest_uniform("g_wd", 0., 1.)
-    cfg.optim.multiply_loss_discrepancy = trial.suggest_uniform("mld", -2, 2)
+    cfg.multiply_loss_discrepancy = trial.suggest_uniform("mld", 0, 2)
+    # trial_opt = list(Optimizer.supported.keys())
+    # cfg.optim.c_name = trial.suggest_categorical("c_opt", trial_opt)
+    # cfg.optim.g_name = trial.suggest_categorical("g_opt", trial_opt)
+    cat = [1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    cfg.optim.c_lr = trial.suggest_categorical("c_lr", cat)
+    cfg.optim.g_lr = trial.suggest_categorical("g_lr", cat)
+    # cfg.optim.c_lr = trial.suggest_loguniform("c_lr", 0.0001, 0.01)
+    # cfg.optim.g_lr = trial.suggest_loguniform("g_lr", 0.00001, 0.001)
     optimizer = Optimizer(
-        model=model,
-        cfg=cfg.optim
+        model_params=model.parameters(),
+        cfg=cfg.optim,
+        scheduler=Optimizer.SCHEDULER_STP
     )
     updater = MCDUpdater(
         cfg=cfg, model=model, dataloader=dataloader,
         optimizer=optimizer, device=device,
         criterion_c=Criterion(name=Criterion.CEL),
-        criterion_g=Criterion(name=Criterion.diff)
+        criterion_g=Criterion(name=Criterion.diff),
+        metrics=ClassifierMetrics()
     )
 
-    mean_acc_tgt = 0.
+    mean_acc = []
     N_rgu = trial.suggest_int("Nrepeat", 1, 10)
     for epoch in range(1, cfg.epochs + 1):
         print(f"epoch: [{epoch} / {cfg.epochs}]")
         updater.train(N_repeat_generator_update=N_rgu)
-        mean_acc_src, mean_acc_tgt = updater.evaluate()
-    error_rate = 1 - mean_acc_tgt
-    return error_rate
-
-
+        _, acc = updater.evaluate()
+        # mean_acc.append(acc)
+    # ret = mean_acc[0] - mean_acc[1]
+    ret = 1 - acc
+    return ret
 
 if __name__ == '__main__':
     import random
@@ -469,8 +610,9 @@ if __name__ == '__main__':
         train(seed)
     else:
 
-        study = optuna.create_study()
-        study.optimize(objective, n_trials=100, n_jobs=-1)
+        # study = optuna.create_study(direction="maximize")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=100)
 
         ##########
         # oputna log
