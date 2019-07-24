@@ -1,0 +1,12 @@
+version: '2.3'
+
+services:
+  python:
+    runtime: nvidia
+    image: sandbox/da/mcd
+    volumes:
+      - ${PROJECT_ROOT}:${PROJECT_ROOT}
+      - ${PYTORCH_ROOT}:${PYTORCH_ROOT}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0,1"
+

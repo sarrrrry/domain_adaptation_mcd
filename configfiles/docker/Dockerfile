@@ -1,4 +1,4 @@
-FROM python:3.7.4-slim-stretch AS python-env
+FROM nvcr.io/nvidia/pytorch:19.05-py3
 
 COPY requirements.txt /root/requirements.txt
 WORKDIR /root
