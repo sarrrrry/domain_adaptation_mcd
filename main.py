@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-
 from tqdm import tqdm
+
+from mcd.networks.base_net_mcd import BaseNetMCD
 
 
 class Net_FeatureExtractore(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 20, 5, 1)
+        self.conv1 = nn.Conv2d(3, 20, 5, 1)
         self.conv2 = nn.Conv2d(20, 50, 5, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -24,7 +25,7 @@ class Net_FeatureExtractore(nn.Module):
 class Net_Classifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(4 * 4 * 50, 500)
+        self.fc1 = nn.Linear(5 * 5 * 50, 500)
         self.fc2 = nn.Linear(500, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -33,56 +34,7 @@ class Net_Classifier(nn.Module):
         return x
 
 
-from abc import ABCMeta
-
-
-class BaseMCD(nn.Module, metaclass=ABCMeta):
-    STATE_KEY_GEN = "generator"
-    STATE_KEY_CLS_F1 = "classifier_f1"
-    STATE_KEY_CLS_F2 = "classifier_f2"
-
-    def __init__(self, ckpt: str = None):
-        super().__init__()
-        self.generator: nn.Module
-        self.classifier_f1: nn.Module
-        self.classifier_f2: nn.Module
-
-    def load(self, path):
-        state_dict = torch.load(str(path))
-        try:
-            self.generator.load_state_dict(state_dict[self.STATE_KEY_GEN])
-
-            self.classifier_f1.load_state_dict(state_dict[self.STATE_KEY_CLS_F1])
-            self.classifier_f2.load_state_dict(state_dict[self.STATE_KEY_CLS_F2])
-        except KeyError:
-            keys = list(state_dict.keys())
-            msg = str(
-                "KeyErrored skip: \n"
-                f"\tReceive: {key}\n"
-                f"\tExpect : {keys}"
-            )
-            print(msg)
-        return self
-
-    def save(self, path: str) -> None:
-        print("*** saving model ...", end="")
-        state_dict = {
-            self.STATE_KEY_GEN: self.generator.state_dict(),
-            self.STATE_KEY_CLS_F1: self.classifier_f1.state_dict(),
-            self.STATE_KEY_CLS_F2: self.classifier_f2.state_dict(),
-        }
-        torch.save(state_dict, str(path))
-        print("DONE")
-
-    def parameters(self, recurse=True):
-        gen_params = self.generator.parameters(recurse=recurse)
-
-        f1_cls_params = self.classifier_f1.parameters(recurse=recurse)
-        f2_cls_params = self.classifier_f2.parameters(recurse=recurse)
-
-        return gen_params, f1_cls_params, f2_cls_params
-
-class Net(BaseMCD):
+class Net(BaseNetMCD):
     def __init__(self, ckpt: str = None):
         super().__init__()
         self.generator = Net_FeatureExtractore()
@@ -105,25 +57,23 @@ class Config:
         pass
 
     class Optim(BaseChildConfig):
-        c_name = "sgd"
-        c_lr = 0.000001  # from optuna
-        # c_weight_decay = 0.173  # from optuna
-        # c_name = "adam"
-        # c_lr = 0.0002  # from optuna
-        c_weight_decay = 0.0005  # from optuna
-        g_name = "sgd"
-        g_lr = 0.000001  # from optuna
-        # g_weight_decay = 0.254  # from optuna
-        # g_name = "adam"
-        # g_lr = 0.0002  # from optuna
-        g_weight_decay = 0.0005  # from optuna
+        # c_name = "sgd"
+        # c_lr = 0.000000002
+        c_name = "adam"
+        c_lr = 0.0002
+        c_weight_decay = 0.0005
+        g_name = "adam"
+        g_lr = 0.0002
+        g_weight_decay = 0.0005
 
     def __init__(self):
         self.N_repeat_genrator_update = 5  # from optuna
         self.multiply_loss_discrepancy = 1.8  # from optuna
         self.seed = 1
         # self.batch_size = 64
-        self.batch_size = 4056
+        # self.batch_size = 10000
+        # self.batch_size = 4056
+        self.batch_size = 128
         # self.test_batch_size = 64
         self.test_batch_size = self.batch_size
         self.epochs = 10000
@@ -162,27 +112,39 @@ class ConcatDataset(torch.utils.data.Dataset):
         return min(len(self.source), len(self.target))
 
 
+class ConcatGray2RGB:
+    def __call__(self, img: torch.Tensor):
+        if not len(img.shape) == 3:
+            raise ValueError
+        img = torch.cat((img, img, img), 0)
+        return img
 class TwoDomainDataLoader:
     def __init__(self, device: Device, batch_size: int, test_batch_size: int, seed=1):
+        img_size = (32, 32)
         kwargs = {'num_workers': 1, 'pin_memory': True} if device.is_cuda else {}
 
         DATA_ROOT = "/raid/pytorch"
         source = datasets.SVHN(
             str(DATA_ROOT), split="train", download=True,
             transform=transforms.Compose([
-                transforms.Grayscale(),
-                transforms.Resize((28, 28)),
+                transforms.Resize(img_size),
                 transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,))
+                transforms.Normalize(
+                    (0.5, 0.5, 0.5),
+                    (0.5, 0.5, 0.5),
+                )
             ])
         )
         target = datasets.MNIST(
             str(DATA_ROOT), train=True, download=True,
             transform=transforms.Compose([
-                transforms.Grayscale(),
-                transforms.Resize((28, 28)),
+                transforms.Resize(img_size),
                 transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,))
+                ConcatGray2RGB(),
+                transforms.Normalize(
+                    (0.5, 0.5, 0.5),
+                    (0.5, 0.5, 0.5),
+                )
             ])
         )
         train_dataset = ConcatDataset(source, target)
@@ -268,18 +230,18 @@ class Optimizer:
             raise ValueError
 
         self.generator = self.supported[cfg.g_name](
-            model_params[0], momentum=0.8,
-            # model_params[0],
+            # model_params[0], momentum=0.8,
+            model_params[0],
             lr=cfg.g_lr, weight_decay=cfg.g_weight_decay
         )
         self.classifier_f1 = self.supported[cfg.c_name](
-            model_params[1], momentum=0.8,
-            # model_params[1],
+            # model_params[1], momentum=0.8,
+            model_params[1],
             lr=cfg.c_lr, weight_decay=cfg.c_weight_decay
         )
         self.classifier_f2 = self.supported[cfg.c_name](
-            model_params[2], momentum=0.8,
-            # model_params[2],
+            # model_params[2], momentum=0.8,
+            model_params[2],
             lr=cfg.c_lr, weight_decay=cfg.c_weight_decay
         )
 
@@ -358,7 +320,7 @@ class ClassifierMetrics:
         pass
 
 class MCDUpdater:
-    def __init__(self, cfg: Config, model: BaseMCD,
+    def __init__(self, cfg: Config, model: BaseNetMCD,
                  dataloader: TwoDomainDataLoader,
                  device: Device,
                  optimizer: Optimizer,
@@ -404,7 +366,8 @@ class MCDUpdater:
 
             self.current_idx += 1
         self.optimizer.step_epoch()
-        self.model.save("lates_model.ckpt")
+        self.model.save("latest_model.ckpt")
+        # self.model.save("latest_model_lr_2e-8.ckpt")
 
     def evaluate(self):
         self.model.eval()
@@ -505,7 +468,8 @@ def train(seed):
         seed=seed
     )
     model = Net()
-    model.load("mnist_cnn.pt")
+    # model.load("mnist_cnn.pt")
+    model.load("latest_model.ckpt")
     model.to(device.get())
     optimizer = Optimizer(
         model_params=model.parameters(),
@@ -554,7 +518,7 @@ def objective(trial: optuna.trial.Trial):
     )
 
     model = Net()
-    model.load("mnist_cnn.pt")
+    # model.load("mnist_cnn.pt")
     model.to(device.get())
 
     cfg.optim.c_weight_decay = trial.suggest_uniform("c_wd", 0., 1.)
@@ -612,7 +576,7 @@ if __name__ == '__main__':
 
         # study = optuna.create_study(direction="maximize")
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=100)
+        study.optimize(objective, n_trials=200, n_jobs=20)
 
         ##########
         # oputna log

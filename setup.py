@@ -3,7 +3,7 @@ from setuptools import setup
 setup(
     name='domain_adaptation_mcd',
     version='0.0.1',
-    packages=['mcd', 'mcd.networks', 'mcd.networks.resnet'],
+    packages=['mcd'],
     url='git@github.com:sarrrrry/domain_adaptation_mcd.git',
     license='',
     author='sarrrrry',
