@@ -6,7 +6,7 @@ colorama==0.4.1
 colorlog==4.0.2
 Mako==1.0.14
 MarkupSafe==1.1.1
-numpy==1.16.4
+numpy==1.22.0
 optuna==0.13.0
 pandas==0.25.0
 pbr==5.4.1
