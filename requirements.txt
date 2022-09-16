@@ -4,7 +4,7 @@ cliff==2.15.0
 cmd2==0.9.14
 colorama==0.4.1
 colorlog==4.0.2
-Mako==1.0.14
+Mako==1.2.2
 MarkupSafe==1.1.1
 numpy==1.16.4
 optuna==0.13.0
